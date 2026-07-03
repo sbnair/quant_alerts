@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="bar">
+  <div class="tabs">
+    {% for m in markets %}
+      <a href="/?market={{ m }}" class="{{ 'active' if m == market }}">
+        {{ {'INDIA':'🇮🇳 India F&O','CRYPTO':'🪙 Crypto','US':'🇺🇸 US'}[m] }}</a>
+    {% endfor %}
+  </div>
+  <button id="scanBtn" {{ 'disabled' if scanning }}>
+    {{ 'Scanning…' if scanning else '▶ Scan Now' }}</button>
+  {% if run %}
+    <span class="muted">Last scan: {{ run.scan_kind }} ·
+      {{ run.finished_at.strftime('%Y-%m-%d %H:%M UTC') if run.finished_at }} ·
+      {{ run.n_symbols }} symbols</span>
+  {% else %}
+    <span class="muted">No scan yet for {{ market }} — hit Scan Now.</span>
+  {% endif %}
+</div>
+
+{% if results %}
+<div class="card" style="padding:0; overflow-x:auto;">
+<table>
+  <thead><tr>
+    <th>#</th><th>Symbol</th><th>Score</th><th>Spot</th><th>Gap %</th>
+    <th>Impl Move %/d</th><th>ATM IV %</th><th>IV/HV</th><th>HV5/20</th>
+    <th>PCR</th><th>ΔOI %</th>
+    {% if market == 'CRYPTO' %}<th>Funding</th>{% endif %}
+    <th>Regime</th><th style="text-align:left">Flags</th>
+  </tr></thead>
+  <tbody>
+  {% for r in results %}
+    {% macro num(v, d=2, sign=False) -%}
+      {%- if v is none -%}<span class="muted">–</span>
+      {%- else -%}{{ '%+.*f'|format(d, v) if sign else '%.*f'|format(d, v) }}{%- endif -%}
+    {%- endmacro %}
+    <tr>
+      <td>{{ r.rank }}</td>
+      <td><strong>{{ r.symbol }}</strong></td>
+      <td class="{{ 'score-hi' if r.score >= 70 else ('score-md' if r.score >= 55) }}">
+        {{ num(r.score, 1) }}</td>
+      <td>{{ num(r.spot) }}</td>
+      <td class="{{ 'neg' if r.gap_pct and r.gap_pct < 0 else ('pos' if r.gap_pct) }}">
+        {{ num(r.gap_pct, 2, True) }}</td>
+      <td>{{ num(r.implied_move) }}</td>
+      <td>{{ num(r.atm_iv, 1) }}</td>
+      <td>{{ num(r.iv_hv_ratio) }}</td>
+      <td>{{ num(r.hv_ratio) }}</td>
+      <td>{{ num(r.pcr) }}</td>
+      <td>{{ num(r.oi_change_pct, 1, True) }}</td>
+      {% if market == 'CRYPTO' %}
+        <td>{{ num(r.funding_rate * 100 if r.funding_rate is not none else none, 4) }}%</td>
+      {% endif %}
+      <td class="{{ 'neg' if r.regime == 'Negative Gamma' }}">
+        {{ r.regime or '–' }}</td>
+      <td style="text-align:left">
+        {% for f in r.flags.split(',') if f %}
+          <span class="pill {{ 'crit' if 'GAMMA' in f else ('high' if f in ('GAP_RISK','IMPLIED_MOVE_SPIKE') else 'med') }}">{{ f.replace('_',' ') }}</span>
+        {% endfor %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+const market = "{{ market }}";
+document.getElementById('scanBtn').addEventListener('click', async (e) => {
+  e.target.disabled = true; e.target.textContent = 'Scanning…';
+  await fetch(`/api/scan/${market}/run`, {method: 'POST'});
+  poll();
+});
+async function poll() {
+  const r = await (await fetch(`/api/scan/${market}`)).json();
+  if (r.scanning) { setTimeout(poll, 5000); }
+  else { location.reload(); }
+}
+{% if scanning %}poll();{% endif %}
+</script>
+{% endblock %}
