@@ -86,6 +86,75 @@ LightGBM ranker replacing the hand-set weights).
 
 ## Architecture
 
+*(Diagrams are [Mermaid](https://mermaid.js.org/) — they render inline on
+GitHub and in most markdown viewers. Pre-rendered copies for platforms that
+don't render Mermaid live in [`docs/diagrams/`](docs/diagrams/), as both SVG
+and 2× PNG: `architecture`, `scan-sequence`, `scanrun-states`, `data-model`,
+`module-view`. After editing a diagram here, regenerate them with
+`docs/render_diagrams.sh`.)*
+
+### High-level view
+
+```mermaid
+flowchart LR
+    subgraph ext["External data sources"]
+        DHAN["Dhan API v2<br/>option chains"]
+        BIN["Binance FAPI / EAPI"]
+        YF["Yahoo Finance<br/>OHLCV + US chains"]
+    end
+
+    subgraph triggers["Triggers"]
+        APS["APScheduler<br/>cron + interval jobs"]
+        UI["Dashboard Scan Now<br/>POST /api/scan/{market}/run"]
+    end
+
+    subgraph core["Scan core"]
+        SA["scheduler.scan_async<br/>per-market lock, worker thread"]
+        SE["scan_engine.run_scan"]
+        UNI["scanner/universe<br/>F&amp;O universe builder"]
+        IM["data/india_market"]
+        CM["data/crypto_market"]
+        UM["data/us_market"]
+        DC["data/dhan_client<br/>paced 1 req / 3.1 s"]
+        GL["gamma_lite<br/>BS gamma → regime + flip"]
+        VS["volatility_score<br/>percentile score + flags"]
+    end
+
+    subgraph out["Persistence & delivery"]
+        DB[("SQLite<br/>scan_runs · scan_results<br/>alerts · iv_history")]
+        AE["alerts/alert_engine"]
+        TG["Telegram Bot API"]
+        DIS["Discord webhook"]
+        WEB["Flask UI<br/>/ · /alerts · /api/*"]
+    end
+
+    ENV["~/quant_4/.env<br/>credentials, loaded by path"] -.-> core
+
+    APS --> SA
+    UI --> SA
+    SA --> SE
+    SE --> UNI
+    SE --> IM
+    SE --> CM
+    SE --> UM
+    IM --> DC --> DHAN
+    IM --> YF
+    CM --> BIN
+    UM --> YF
+    IM --> GL
+    CM --> GL
+    UM --> GL
+    SE --> VS
+    SE --> DB
+    SE --> AE
+    AE --> TG
+    AE --> DIS
+    AE --> DB
+    WEB --> DB
+```
+
+### Module layout
+
 ```
 app.py (Flask + SQLite)
  ├── scheduler.py            APScheduler cron/interval jobs, per-market run locks
@@ -121,6 +190,239 @@ Telegram and Discord, then individual flag alerts for symbols scoring above
 `MIN_SCORE_FOR_ALERT` (the critical `NEGATIVE_GAMMA_GAP` is exempt from the
 score gate). The same symbol + flag is deduped to once per market per day,
 and everything is persisted to SQLite for the `/alerts` page.
+
+### Scan lifecycle — sequence
+
+One scan, from trigger to delivered alerts (identical for scheduled and
+manual runs — both funnel through `scheduler.scan_async`):
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant T as Trigger<br/>(cron job / UI POST)
+    participant S as scheduler.scan_async
+    participant R as scan_engine.run_scan<br/>(worker thread)
+    participant C as market collector
+    participant X as Data source<br/>(Dhan / Binance / Yahoo)
+    participant V as volatility_score
+    participant D as SQLite
+    participant A as alert_engine
+    participant N as Telegram + Discord
+
+    T->>S: scan_async(market, kind)
+    alt scan already running for this market
+        S-->>T: False → UI gets 409
+    else lock acquired
+        S->>R: spawn daemon thread
+        R->>D: INSERT ScanRun (status=running)
+        R->>C: collect features
+        C->>X: batch OHLCV history (single download)
+        loop each symbol in universe
+            C->>X: option chain / klines / OI / funding
+            Note over C,X: Dhan requests serialized,<br/>3.1 s apart (rate limit)
+            C-->>C: per-symbol failure → skip, continue
+        end
+        C-->>R: list of feature dicts
+        R->>V: score_universe(features)
+        V-->>R: DataFrame + score, rank, flags
+        R->>D: ScanResult rows + features_json,<br/>IVHistory upsert, run → done
+        R->>A: process_scan(scored)
+        A->>N: ranked top-N digest
+        A->>D: log VOL_SCORE_TOP_N alert
+        loop flagged symbols ≥ MIN_SCORE_FOR_ALERT
+            A->>D: dedupe check (market+symbol+flag, today)
+            A->>N: flag alert + risk guidance
+            A->>D: log Alert (sent_telegram / sent_discord)
+        end
+        R->>S: release market lock (finally)
+    end
+```
+
+A `ScanRun` row tracks each pass through a tiny state machine — any
+exception in collection or scoring marks the run `failed` rather than
+leaving it dangling:
+
+```mermaid
+stateDiagram-v2
+    [*] --> running : ScanRun created
+    running --> done : scored + persisted + alerted
+    running --> failed : collector / scoring exception
+    done --> [*]
+    failed --> [*]
+```
+
+## Data model
+
+Four tables in SQLite (Flask-SQLAlchemy). `scan_results` is deliberately
+wide — one denormalized feature row per symbol per scan, plus the complete
+raw snapshot in `features_json` for future model training. Only the key
+columns are shown here:
+
+```mermaid
+erDiagram
+    SCAN_RUNS ||--o{ SCAN_RESULTS : "has"
+
+    SCAN_RUNS {
+        int      id PK
+        string   market_type "INDIA | CRYPTO | US"
+        string   scan_kind "premarket | postopen | intraday | manual"
+        datetime started_at
+        datetime finished_at
+        int      n_symbols
+        string   status "running | done | failed"
+    }
+
+    SCAN_RESULTS {
+        int    id PK
+        int    run_id FK
+        string market_type
+        string symbol
+        float  spot
+        float  gap_pct
+        float  implied_move
+        float  atm_iv
+        float  iv_hv_ratio
+        float  hv_ratio
+        float  pcr
+        float  oi_change_pct
+        string regime
+        float  gamma_flip
+        float  funding_rate "crypto only"
+        text   features_json "full raw snapshot"
+        float  score "composite 0-100"
+        int    rank
+        string flags "comma-separated"
+    }
+
+    ALERTS {
+        int      id PK
+        datetime created_at
+        string   market_type
+        string   symbol
+        string   alert_type "flag name or VOL_SCORE_TOP_N"
+        string   severity "INFO | MEDIUM | HIGH | CRITICAL"
+        text     message
+        float    score
+        bool     sent_telegram
+        bool     sent_discord
+    }
+
+    IV_HISTORY {
+        int    id PK
+        string symbol UK "unique with date"
+        string market_type
+        date   date UK
+        float  atm_iv "daily ATM IV - feeds future IV Rank"
+    }
+```
+
+`alerts` doubles as the dedupe store — `_already_sent_today()` queries it
+by market + symbol + alert_type + UTC day before sending. `iv_history` is
+upserted once per symbol per day (unique constraint on symbol + date).
+
+## Module / class view
+
+The codebase is functional-style Python modules rather than deep class
+hierarchies, so this is a module diagram with each module's public surface:
+
+```mermaid
+classDiagram
+    class scheduler {
+        <<module>>
+        -_running : dict per-market
+        -_lock : threading.Lock
+        +scan_async(app, market, kind, notify) bool
+        +start(app) BackgroundScheduler
+        +jobs_info() list
+        +is_running(market) bool
+    }
+    class scan_engine {
+        <<module>>
+        +run_scan(app, market, kind, notify) int
+        +COLLECTORS : dict market → collector
+        -_collect_india(progress) list
+        -_collect_crypto(progress) list
+        -_collect_us(progress) list
+    }
+    class universe {
+        <<module>>
+        +build_india_universe(force) DataFrame
+        +india_universe(limit) DataFrame
+        +crypto_universe(limit) list
+        +us_universe() list
+    }
+    class volatility_score {
+        <<module>>
+        +score_universe(features) DataFrame
+        +FLAG_SEVERITY : dict
+        +FLAG_GUIDANCE : dict
+        -_pct_rank(series) Series
+        -_flags(row) str
+    }
+    class dhan_client {
+        <<module>>
+        -_paced() global lock + 3.1s gap
+        +expiry_list(sec_id, segment) list
+        +option_chain(sec_id, segment, expiry) dict
+    }
+    class india_market {
+        <<module>>
+        +batch_history(symbols) dict
+        +price_features(hist) dict
+        +fetch_symbol(symbol, sec_id, segment, lot, hist) dict
+        -_chain_features(sec_id, segment, lot) dict
+    }
+    class crypto_market {
+        <<module>>
+        +ticker_24h() dict
+        +reset_cache()
+        +fetch_symbol(symbol, tick) dict
+        -_klines_features(symbol) dict
+        -_implied_move(asset, spot) tuple
+        -_funding(symbol) float
+        -_oi_change(symbol) float
+    }
+    class us_market {
+        <<module>>
+        +batch_history(symbols) dict
+        +fetch_symbol(symbol, hist) dict
+    }
+    class gamma_lite {
+        <<module>>
+        +bs_gamma(S, K, T, r, sigma) float
+        +gamma_regime(options_df, spot, contract_size) tuple
+    }
+    class alert_engine {
+        <<module>>
+        +process_scan(scored, market, kind)
+        -_already_sent_today(market, symbol, type) bool
+    }
+    class telegram_alert {
+        <<module>>
+        +send_alert(alert) bool
+        +send_digest(rows, market, kind) bool
+    }
+    class discord_alert {
+        <<module>>
+        +send_alert(alert) bool
+        +send_digest(rows, market, kind) bool
+    }
+
+    scheduler --> scan_engine : spawns worker
+    scan_engine --> universe
+    scan_engine --> india_market
+    scan_engine --> crypto_market
+    scan_engine --> us_market
+    scan_engine --> volatility_score
+    scan_engine --> alert_engine
+    india_market --> dhan_client
+    india_market --> gamma_lite
+    crypto_market --> gamma_lite
+    us_market --> gamma_lite
+    us_market ..> india_market : reuses price_features()
+    alert_engine --> telegram_alert
+    alert_engine --> discord_alert
+```
 
 ## The engineering problems worth writing down
 
